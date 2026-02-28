@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Project: Debug - 무기 제작소</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Game State Initialization -->
+    <script>
+        window.gameState = {
+            level: 0,
+            gold: 1000,
+            scrap: 100,
+            magic: 10,
+            score: 0,
+            boxes: { wood: 0, iron: 0, gold: 0, legend: 0 }
+        };
+        window.currentUserId = null; 
+        window.currentDocId = null;  
+        window.userScoreListener = null; 
+    </script>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, getDoc, getDocs, onSnapshot, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const myFirebaseConfig = {
+            apiKey: "AIzaSyAQc4zmexSGF19tSTJs6pTgtFOE0z--6XA",
+            authDomain: "game-28340361-cd827.firebaseapp.com",
+            projectId: "game-28340361-cd827",
+            storageBucket: "game-28340361-cd827.firebasestorage.app",
+            messagingSenderId: "642880657235",
+            appId: "1:642880657235:web:b0b00984a8b5590f1bb3a6"
+        };
+
+        const firebaseConfig = myFirebaseConfig;
+        const gameAppId = typeof __app_id !== 'undefined' ? __app_id : "game-28340361-cd827"; 
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = window.db = getFirestore(app);
+
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    try {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } catch (tokenError) {
+                        await signInAnonymously(auth);
+                    }
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        listenToLeaderboard();
+                    }
+                });
+            } catch (error) {
+                console.error("인증 실패:", error);
+            }
+        };
+        initAuth();
+
+        // 쿨다운 타이머 처리 함수
+        let cdInterval;
+        window.startCooldownTimer = function() {
+            clearInterval(cdInterval);
+            const btn = document.getElementById('btn-load-data');
+            
+            cdInterval = setInterval(() => {
+                const cdUntil = parseInt(localStorage.getItem('terminalCooldown') || '0');
+                const now = Date.now();
+                
+                if (now < cdUntil) {
+                    const diff = cdUntil - now;
+                    const min = Math.floor(diff / 60000);
+                    const sec = Math.floor((diff % 60000) / 1000);
+                    btn.innerText = `터미널 과열: ${min}분 ${sec}초`;
+                    btn.disabled = true;
+                    btn.classList.add('bg-gray-600', 'cursor-not-allowed', 'opacity-70');
+                    btn.classList.remove('bg-blue-600', 'hover:bg-blue-500', 'active:scale-95');
+                } else {
+                    clearInterval(cdInterval);
+                    btn.innerText = "터미널 연결";
+                    btn.disabled = false;
+                    btn.classList.remove('bg-gray-600', 'cursor-not-allowed', 'opacity-70');
+                    btn.classList.add('bg-blue-600', 'hover:bg-blue-500', 'active:scale-95');
+                }
+            }, 1000);
+        };
+        // 페이지 로드 시 바로 쿨다운 확인
+        window.startCooldownTimer();
+
+        window.loadUserData = async function() {
+            const cdUntil = parseInt(localStorage.getItem('terminalCooldown') || '0');
+            if (Date.now() < cdUntil) {
+                showToast('터미널이 과열 상태입니다. 잠시 후 시도하세요.', 'bg-red-600');
+                return;
+            }
+
+            const inputVal = document.getElementById('user-id-input').value.trim();
+            const btn = document.getElementById('btn-load-data');
+
+            if (!inputVal) {
+                showToast('등수(숫자)를 입력해주세요.', 'bg-red-600');
+                return;
+            }
+
+            const targetRank = parseInt(inputVal, 10);
+            if (isNaN(targetRank) || targetRank <= 0) {
+                showToast('올바른 등수(1 이상의 숫자)를 입력해주세요.', 'bg-red-600');
+                return;
+            }
+
+            btn.innerText = "랭킹 스캔 중...";
+            btn.disabled = true;
+
+            try {
+                const scoresColRef = collection(db, 'scores');
+                const querySnapshot = await getDocs(scoresColRef);
+                
+                const allScores = [];
+                querySnapshot.forEach((docSnap) => {
+                    allScores.push({ id: docSnap.id, data: docSnap.data() });
+                });
+
+                allScores.sort((a, b) => (b.data.score || 0) - (a.data.score || 0));
+
+                if (allScores.length === 0 || targetRank > allScores.length) {
+                    showToast(`해당 데이터가 없습니다.`, 'bg-red-600');
+                    btn.innerText = "터미널 연결"; btn.disabled = false;
+                    return;
+                }
+
+                const targetItem = allScores[targetRank - 1];
+                const targetDocId = targetItem.id;
+                const targetData = targetItem.data;
+
+                // [핵심] inUse 값이 1 이상인지 확인 (동시 접속 방지)
+                if (targetData.inUse && targetData.inUse >= 1) {
+                    showToast('해당 데이터가 없습니다.', 'bg-red-600');
+                    btn.innerText = "터미널 연결"; btn.disabled = false;
+                    return;
+                }
+
+                // 타겟 문서에 inUse 플래그를 1로 업데이트
+                const targetRef = doc(db, 'scores', targetDocId);
+                await updateDoc(targetRef, { inUse: 1 });
+
+                // 5분 쿨다운 설정
+                localStorage.setItem('terminalCooldown', Date.now() + 5 * 60 * 1000);
+                window.startCooldownTimer();
+                
+                // ===== [신규 기능] 학살 점수 비례 보상 지급 =====
+                const targetScore = targetData.score || 0;
+                const scrapReward = targetScore * 2;
+                const boxCount = Math.floor(targetScore / 100);
+                
+                window.gameState.scrap += scrapReward;
+                
+                let gained = { wood: 0, iron: 0, gold: 0, legend: 0, none: 0 };
+                
+                // 상자 롤링 (나무 50%, 철 45%, 황금 4.5%, 전설 0.45%, 꽝 0.05%)
+                for(let i=0; i<boxCount; i++) {
+                    const rand = Math.random() * 100; // 0 ~ 99.999...
+                    if (rand < 50) { gained.wood++; window.gameState.boxes.wood++; }
+                    else if (rand < 95) { gained.iron++; window.gameState.boxes.iron++; }
+                    else if (rand < 99.5) { gained.gold++; window.gameState.boxes.gold++; }
+                    else if (rand < 99.95) { gained.legend++; window.gameState.boxes.legend++; }
+                    else { gained.none++; }
+                }
+
+                // 보상 UI 업데이트
+                document.getElementById('ui-reward-scrap').innerText = scrapReward.toLocaleString();
+                document.getElementById('ui-reward-boxtotal').innerText = boxCount.toLocaleString();
+                document.getElementById('ui-reward-wood').innerText = gained.wood;
+                document.getElementById('ui-reward-iron').innerText = gained.iron;
+                document.getElementById('ui-reward-gold').innerText = gained.gold;
+                document.getElementById('ui-reward-legend').innerText = gained.legend;
+                document.getElementById('ui-reward-none').innerText = gained.none;
+                document.getElementById('scan-reward-ui').classList.remove('hidden');
+                // ===============================================
+
+                const dispName = targetData.name && targetData.name !== "Unknown" ? targetData.name : (targetData.uid || 'Unknown');
+                showToast(`[${targetRank}위] 스캔 완료! 보상이 지급되었습니다.`, 'bg-green-600');
+
+                if(window.userScoreListener) window.userScoreListener();
+
+                window.currentDocId = targetDocId; 
+                window.currentUserId = targetData.uid || 'Unknown';
+                
+                document.getElementById('display-user-id').innerText = `${targetRank}위 - ${dispName}`;
+                
+                // 기존 데이터 덮어쓰기 방지를 위해 일부 수치 유지 (로컬 저장소 동기화 대비)
+                window.gameState.score = targetData.score || 0;
+
+                const liveUserRef = doc(db, 'scores', targetDocId);
+                window.userScoreListener = onSnapshot(liveUserRef, (docSnapshot) => {
+                    if (docSnapshot.exists()) {
+                        const rtData = docSnapshot.data();
+                        window.gameState.score = rtData.score || 0;
+                        const uiScoreEl = document.getElementById('ui-score');
+                        if(uiScoreEl) uiScoreEl.innerText = window.gameState.score.toLocaleString();
+                    }
+                });
+
+                document.getElementById('defense-login').classList.add('hidden');
+                document.getElementById('defense-farm').classList.remove('hidden');
+                document.getElementById('defense-farm').classList.add('flex');
+                
+                updateUI();
+                if(window.syncData) window.syncData(); // 획득한 보상 즉시 저장
+
+            } catch (e) {
+                console.error("Data load error:", e);
+                showToast('데이터베이스 검색 권한/연결 문제가 발생했습니다.', 'bg-red-600');
+                btn.innerText = "터미널 연결";
+                window.startCooldownTimer(); // 상태 복구
+            }
+        };
+
+        // 연결 해제 함수
+        window.disconnectTerminal = async function() {
+            if (window.currentDocId) {
+                try {
+                    const targetRef = doc(window.db, 'scores', window.currentDocId);
+                    await updateDoc(targetRef, { inUse: 0 });
+                } catch(e) {
+                    console.error("Unlock error:", e);
+                }
+            }
+            if (window.userScoreListener) window.userScoreListener();
+            
+            window.currentDocId = null;
+            window.currentUserId = null;
+            
+            document.getElementById('scan-reward-ui').classList.add('hidden'); // 보상 UI 숨김
+            document.getElementById('defense-farm').classList.add('hidden');
+            document.getElementById('defense-farm').classList.remove('flex');
+            document.getElementById('defense-login').classList.remove('hidden');
+            
+            showToast('터미널 연결이 정상적으로 해제되었습니다.', 'bg-gray-600');
+        };
+
+        window.syncData = async function() {
+            if (!window.currentDocId || !db || !auth.currentUser) return;
+            try {
+                const userRef = doc(db, 'scores', window.currentDocId);
+                await setDoc(userRef, {
+                    uid: window.currentUserId,
+                    weaponLevel: window.gameState.level,
+                    gold: window.gameState.gold,
+                    scrap: window.gameState.scrap,
+                    ts: new Date().toLocaleString('ko-KR')
+                }, { merge: true });
+            } catch (e) {
+                console.error("Data sync failed:", e);
+            }
+        };
+
+        function listenToLeaderboard() {
+            if (!db || !auth.currentUser) return;
+            
+            const lbRef = collection(db, 'scores');
+            
+            onSnapshot(lbRef, (snapshot) => {
+                const list = [];
+                snapshot.forEach(doc => list.push(doc.data()));
+                list.sort((a, b) => (b.score || 0) - (a.score || 0)); 
+                
+                const lbContainer = document.getElementById('leaderboard-list');
+                if(!lbContainer) return;
+                lbContainer.innerHTML = '';
+                
+                list.slice(0, 50).forEach((data, index) => {
+                    const isMe = data.uid === window.currentUserId;
+                    const displayName = (data.name && data.name !== "Unknown") ? data.name : (data.uid || 'Unknown');
+                    
+                    // 누군가 접속 중인지 표시
+                    const inUseBadge = (data.inUse && data.inUse >= 1) ? `<span class="bg-red-900 text-red-300 text-[10px] px-1.5 py-0.5 rounded ml-2 font-bold"><i class="fa-solid fa-lock text-[10px]"></i> 접속중</span>` : '';
+
+                    const el = document.createElement('div');
+                    el.className = `flex justify-between items-center p-3 rounded-lg ${isMe ? 'bg-blue-900 border border-blue-400' : 'bg-gray-800'} mb-2 relative overflow-hidden`;
+                    
+                    let timeStr = "";
+                    if (data.ts) {
+                        try {
+                            let tsStr = (typeof data.ts === 'string') ? data.ts : String(data.ts);
+                            const match = tsStr.match(/(\d+일) (PM|AM) (\d+시 \d+분)/);
+                            timeStr = match ? `${match[1]} ${match[2]} ${match[3]}` : (tsStr.split(' ')[0] || "");
+                        } catch(e) {}
+                    }
+
+                    el.innerHTML = `
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold ${index < 3 ? 'text-yellow-400' : 'text-gray-400'} w-6 text-center">#${index + 1}</span>
+                            <span class="text-sm truncate max-w-[100px] text-gray-300">${displayName}</span>
+                            ${inUseBadge}
+                        </div>
+                        <div class="text-right">
+                            <div class="text-red-400 font-bold"><i class="fa-solid fa-skull"></i> ${data.score || 0}</div>
+                            <div class="text-[10px] text-gray-400 mt-1">
+                                ${data.weaponLevel ? `<span class="text-green-300 mr-1">(+${data.weaponLevel})</span>` : ''}
+                                ${timeStr ? `<span class="opacity-50">${timeStr}</span>` : ''}
+                            </div>
+                        </div>
+                    `;
+                    lbContainer.appendChild(el);
+                });
+            });
+        }
+    </script>
+
+    <style>
+        body { font-family: 'Pretendard', sans-serif; user-select: none; -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
+        .glitch-screen { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 9999; color: red; font-family: monospace; padding: 20px; box-sizing: border-box; flex-direction: column; overflow: hidden; }
+        .glitch-anim { animation: glitch 0.2s linear infinite; }
+        @keyframes glitch { 0% { transform: translate(0) } 20% { transform: translate(-2px, 2px) } 40% { transform: translate(-2px, -2px) } 60% { transform: translate(2px, 2px) } 80% { transform: translate(2px, -2px) } 100% { transform: translate(0) } }
+        .fleeing-btn { position: absolute; transition: top 0.1s, left 0.1s; }
+        .upgrade-effect { animation: pop 0.3s ease-out; }
+        @keyframes pop { 0% { transform: scale(1); } 50% { transform: scale(1.3); filter: brightness(1.5); } 100% { transform: scale(1); } }
+        .glow-normal { filter: drop-shadow(0 0 5px rgba(255,255,255,0.2)); }
+        .glow-magic { filter: drop-shadow(0 0 12px rgba(59, 130, 246, 0.7)); }
+        .glow-epic { filter: drop-shadow(0 0 18px rgba(168, 85, 247, 0.9)); }
+        .glow-legend { filter: drop-shadow(0 0 25px rgba(234, 179, 8, 1)); }
+        .glow-mythic { filter: drop-shadow(0 0 35px rgba(239, 68, 68, 1)); }
+        .nav-active { color: #60a5fa; border-top: 2px solid #60a5fa; }
+    </style>
+</head>
+<body class="bg-gray-950 text-white h-screen flex flex-col overflow-hidden">
+
+    <!-- Header -->
+    <header class="bg-gray-900 p-4 shadow-md flex justify-between items-center z-10 border-b border-gray-800">
+        <div id="dev-trigger" class="font-bold text-xl tracking-wider cursor-pointer">
+            <span class="text-blue-500">[</span>Project: Debug<span class="text-blue-500">]</span>
+        </div>
+        <div class="flex gap-4 text-sm font-semibold">
+            <span class="text-yellow-400 bg-gray-800 px-2 py-1 rounded"><i class="fa-solid fa-coins"></i> <span id="ui-gold">1000</span></span>
+            <span class="text-gray-400 bg-gray-800 px-2 py-1 rounded"><i class="fa-solid fa-gear"></i> <span id="ui-scrap">100</span></span>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 overflow-y-auto pb-20 relative">
+        
+        <!-- Tab 1: Forge -->
+        <section id="tab-forge" class="p-4 flex flex-col items-center h-full justify-center space-y-6">
+            <div class="text-center">
+                <h2 class="text-2xl font-bold mb-1">장비 강화소</h2>
+                <p class="text-gray-400 text-sm">진화할수록 무기의 형태가 변합니다.</p>
+            </div>
+            
+            <div class="flex flex-col items-center w-full">
+                <div id="weapon-name" class="text-2xl font-black mb-4 text-center tracking-wide text-gray-200">나무 막대기</div>
+                
+                <div class="relative w-56 h-56 bg-gray-800 rounded-full flex items-center justify-center border-4 border-gray-700 shadow-2xl overflow-visible">
+                    <i id="weapon-icon" class="fa-solid fa-leaf text-7xl text-green-600 glow-normal transition-all duration-300"></i>
+                    <div class="absolute -bottom-5 bg-blue-600 px-5 py-2 rounded-full font-bold text-xl border-2 border-gray-900 shadow-lg" id="ui-level">+0</div>
+                </div>
+            </div>
+
+            <div class="w-full max-w-sm bg-gray-900 p-4 rounded-xl shadow-inner text-sm space-y-3 border border-gray-800">
+                <div class="flex justify-between"><span class="text-gray-400">성공 확률</span> <span id="ui-chance" class="font-bold text-green-400">100%</span></div>
+                <div class="flex justify-between"><span class="text-gray-400">소모 골드</span> <span id="ui-cost-gold" class="text-yellow-400 font-bold">100</span></div>
+                <div class="flex justify-between"><span class="text-gray-400">소모 고철</span> <span id="ui-cost-scrap" class="text-gray-300 font-bold">10</span></div>
+                <div class="flex justify-between border-t border-gray-800 pt-2"><span class="text-gray-400">실패 페널티</span> <span id="ui-destroy" class="text-red-400">안전</span></div>
+            </div>
+
+            <button onclick="upgradeWeapon()" class="w-full max-w-sm bg-blue-600 active:bg-blue-700 p-4 rounded-xl font-bold text-xl shadow-[0_4px_0_#1e3a8a] active:shadow-[0_0px_0_#1e3a8a] active:translate-y-1 transition-all">
+                강화하기
+            </button>
+        </section>
+
+        <!-- Tab 2: 데이터 터미널 -->
+        <section id="tab-defense" class="p-4 hidden h-full flex flex-col">
+            <h2 class="text-2xl font-bold mb-4"><i class="fa-solid fa-database text-blue-500"></i> 실시간 데이터 터미널</h2>
+            
+            <div id="defense-login" class="bg-gray-800 rounded-xl p-6 flex flex-col items-center justify-center flex-1 border border-gray-700">
+                <i class="fa-solid fa-satellite-dish text-5xl mb-4 text-blue-400"></i>
+                <h3 class="text-2xl font-bold mb-2">요원 데이터 스캔</h3>
+                <p class="text-sm text-gray-400 mb-6 text-center leading-relaxed">
+                    원하는 랭킹 <span class="text-yellow-400 font-bold">등수(숫자)</span>를 입력하면<br>
+                    해당 순위 요원의 실시간 데이터를 연결합니다.
+                </p>
+                <input type="number" min="1" id="user-id-input" class="w-full max-w-xs bg-gray-900 border-2 border-gray-600 p-3 rounded-lg mb-6 text-center text-xl font-bold focus:outline-none focus:border-blue-500 transition-colors" placeholder="등수 입력 (예: 1)">
+                <button id="btn-load-data" onclick="loadUserData()" class="w-full max-w-xs bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-bold text-lg shadow-lg active:scale-95 transition-all disabled:opacity-70 transition-colors duration-300">
+                    터미널 연결
+                </button>
+            </div>
+
+            <div id="defense-farm" class="hidden bg-gray-800 rounded-xl p-4 flex-1 flex-col items-center justify-between relative overflow-hidden border border-gray-700 overflow-y-auto">
+                <div class="w-full px-4 flex justify-between items-center text-sm font-bold bg-gray-900 p-3 rounded-lg border border-gray-700 shadow-inner">
+                    <span class="text-gray-400">연결된 요원:</span>
+                    <span id="display-user-id" class="text-blue-400 tracking-wider">???</span>
+                </div>
+                
+                <div class="text-center z-10 w-full mt-6 mb-2">
+                    <div class="text-gray-400 mb-2 font-bold tracking-widest text-lg">실시간 누적 학살 점수</div>
+                    <div class="text-6xl font-black text-red-500 mb-2 font-mono drop-shadow-[0_0_15px_rgba(239,68,68,0.8)]" id="ui-score">0</div>
+                    <p class="text-xs text-gray-500">해당 랭커의 데이터를 실시간 수신 중입니다.</p>
+                </div>
+
+                <!-- 획득 보상 UI 패널 -->
+                <div id="scan-reward-ui" class="hidden w-full mb-4 bg-gray-900 p-4 rounded-lg border border-gray-700 text-sm text-left shadow-inner">
+                    <div class="text-green-400 font-bold mb-3 border-b border-gray-700 pb-2"><i class="fa-solid fa-gift"></i> 스캔 완료 보상 (1회성)</div>
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-gray-400">획득한 고철:</span>
+                        <span class="text-gray-200 font-bold">+<span id="ui-reward-scrap">0</span> <i class="fa-solid fa-gear text-xs"></i></span>
+                    </div>
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-gray-400">획득한 상자 (총 <span id="ui-reward-boxtotal">0</span>개 롤링):</span>
+                    </div>
+                    <div class="grid grid-cols-5 gap-2 text-center text-xs">
+                        <div class="bg-gray-800 p-1.5 rounded border border-gray-700"><div class="text-green-500 font-bold mb-1">나무</div><div id="ui-reward-wood" class="text-white font-bold">0</div></div>
+                        <div class="bg-gray-800 p-1.5 rounded border border-gray-700"><div class="text-gray-400 font-bold mb-1">철</div><div id="ui-reward-iron" class="text-white font-bold">0</div></div>
+                        <div class="bg-gray-800 p-1.5 rounded border border-yellow-600"><div class="text-yellow-400 font-bold mb-1">황금</div><div id="ui-reward-gold" class="text-white font-bold">0</div></div>
+                        <div class="bg-gray-800 p-1.5 rounded border border-purple-500"><div class="text-purple-400 font-bold mb-1">전설</div><div id="ui-reward-legend" class="text-white font-bold">0</div></div>
+                        <div class="bg-gray-800 p-1.5 rounded border border-gray-700"><div class="text-red-500 font-bold mb-1">꽝</div><div id="ui-reward-none" class="text-gray-500 font-bold">0</div></div>
+                    </div>
+                </div>
+
+                <div class="w-full mt-auto">
+                    <button onclick="disconnectTerminal()" class="w-full bg-red-900 border border-red-600 hover:bg-red-800 text-red-200 py-3 rounded-lg font-bold shadow-lg active:scale-95 transition-transform flex justify-center items-center gap-2">
+                        <i class="fa-solid fa-power-off"></i> 연결 종료 (잠금 해제)
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab 3: Inventory & Shop -->
+        <section id="tab-inventory" class="p-4 hidden h-full flex flex-col">
+            <h2 class="text-2xl font-bold mb-4"><i class="fa-solid fa-box-open text-yellow-500"></i> 인벤토리 및 보급소</h2>
+            
+            <div class="grid grid-cols-2 gap-3 mb-6">
+                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 flex flex-col items-center">
+                    <i class="fa-solid fa-box text-3xl text-amber-600 mb-2"></i>
+                    <div class="text-sm text-gray-300">나무 상자 (<span id="box-wood">0</span>)</div>
+                    <div class="flex gap-2 mt-2 w-full">
+                        <button onclick="openBox('wood')" class="flex-1 bg-gray-700 text-xs py-2 rounded font-bold">열기</button>
+                        <button onclick="mergeBox('wood', 'iron', 10)" class="flex-1 bg-blue-900 text-xs py-2 rounded font-bold">합성(10)</button>
+                    </div>
+                </div>
+                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 flex flex-col items-center">
+                    <i class="fa-solid fa-box text-3xl text-gray-400 mb-2"></i>
+                    <div class="text-sm text-gray-300">철 상자 (<span id="box-iron">0</span>)</div>
+                    <div class="flex gap-2 mt-2 w-full">
+                        <button onclick="openBox('iron')" class="flex-1 bg-gray-700 text-xs py-2 rounded font-bold">열기</button>
+                        <button onclick="mergeBox('iron', 'gold', 5)" class="flex-1 bg-blue-900 text-xs py-2 rounded font-bold">합성(5)</button>
+                    </div>
+                </div>
+                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 flex flex-col items-center">
+                    <i class="fa-solid fa-box text-3xl text-yellow-400 mb-2 glow-normal"></i>
+                    <div class="text-sm text-gray-300">황금 상자 (<span id="box-gold">0</span>)</div>
+                    <div class="flex gap-2 mt-2 w-full">
+                        <button onclick="openBox('gold')" class="flex-1 bg-gray-700 text-xs py-2 rounded font-bold">열기</button>
+                        <button onclick="mergeBox('gold', 'legend', 3)" class="flex-1 bg-blue-900 text-xs py-2 rounded font-bold">합성(3)</button>
+                    </div>
+                </div>
+                <div class="bg-gray-800 p-3 rounded-lg flex flex-col items-center border-2 border-yellow-500 shadow-[0_0_15px_rgba(234,179,8,0.2)] bg-gradient-to-b from-gray-800 to-purple-900">
+                    <i class="fa-solid fa-box text-3xl text-purple-400 mb-2 glow-epic"></i>
+                    <div class="text-sm text-white font-bold">전설 상자 (<span id="box-legend">0</span>)</div>
+                    <div class="flex gap-2 mt-2 w-full">
+                        <button onclick="openBox('legend')" class="w-full bg-purple-600 hover:bg-purple-500 text-xs py-2 rounded font-bold text-white shadow-lg">열기</button>
+                    </div>
+                </div>
+            </div>
+
+            <h2 class="text-xl font-bold mb-3"><i class="fa-solid fa-store text-green-400"></i> 암시장 (판매)</h2>
+            <div class="bg-gray-900 rounded-lg p-3 space-y-3 border border-gray-800">
+                <div class="flex justify-between items-center bg-gray-800 p-3 rounded">
+                    <span class="font-bold text-gray-300"><i class="fa-solid fa-gear text-gray-400"></i> 고철 10개 팔기</span>
+                    <button onclick="sellResource('scrap', 10, 50)" class="bg-green-600 px-4 py-1.5 rounded font-bold text-sm">+50 골드</button>
+                </div>
+                <div class="flex justify-between items-center bg-gray-800 p-3 rounded">
+                    <span class="font-bold text-gray-300"><i class="fa-solid fa-gem text-purple-400"></i> 마력석 1개 팔기</span>
+                    <button onclick="sellResource('magic', 1, 300)" class="bg-green-600 px-4 py-1.5 rounded font-bold text-sm">+300 골드</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab 4: Leaderboard -->
+        <section id="tab-leaderboard" class="p-4 hidden h-full flex flex-col">
+            <h2 class="text-2xl font-bold mb-4"><i class="fa-solid fa-trophy text-yellow-400"></i> 글로벌 랭킹</h2>
+            <div class="bg-gray-900 rounded-xl p-2 flex-1 overflow-y-auto border border-gray-800" id="leaderboard-list">
+                <div class="text-center text-gray-500 mt-10">
+                    <i class="fa-solid fa-spinner fa-spin text-3xl mb-3"></i><br>
+                    데이터를 불러오는 중입니다...
+                </div>
+            </div>
+        </section>
+
+        <div id="toast-msg" class="fixed top-20 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-6 py-3 rounded-full shadow-2xl opacity-0 pointer-events-none transition-opacity duration-300 z-50 font-bold tracking-wide">
+            메시지
+        </div>
+
+    </main>
+
+    <!-- Bottom Navigation -->
+    <nav class="bg-gray-900 border-t border-gray-800 flex justify-around pb-safe relative z-20">
+        <button onclick="switchTab('forge')" id="nav-forge" class="flex-1 py-4 flex flex-col items-center nav-active transition-colors">
+            <i class="fa-solid fa-hammer mb-1 text-xl"></i><span class="text-xs font-bold">대장간</span>
+        </button>
+        <button onclick="switchTab('defense')" id="nav-defense" class="flex-1 py-4 flex flex-col items-center text-gray-500 transition-colors">
+            <i class="fa-solid fa-database mb-1 text-xl"></i><span class="text-xs font-bold">데이터</span>
+        </button>
+        <button onclick="switchTab('inventory')" id="nav-inventory" class="flex-1 py-4 flex flex-col items-center text-gray-500 transition-colors">
+            <i class="fa-solid fa-box mb-1 text-xl"></i><span class="text-xs font-bold">보급소</span>
+        </button>
+        <button onclick="switchTab('leaderboard')" id="nav-leaderboard" class="flex-1 py-4 flex flex-col items-center text-gray-500 transition-colors">
+            <i class="fa-solid fa-trophy mb-1 text-xl"></i><span class="text-xs font-bold">랭킹</span>
+        </button>
+    </nav>
+
+    <!-- DEVELOPER MODE -->
+    <div id="dev-overlay" class="glitch-screen">
+        <h1 class="text-4xl font-black mb-4">FATAL ERROR: 0x0000DEAD</h1>
+        <p class="mb-4">경고: 비정상적인 [시간 정지] 명령어 감지.</p>
+        <p class="mb-8">시스템 방화벽이 가동되었습니다. 모든 자산이 파기됩니다.</p>
+        <div class="flex-1 relative border border-red-800 bg-red-950 bg-opacity-30 p-4">
+            <p class="text-sm">데이터 초기화 중... <span id="dev-progress">12</span>%</p>
+            <button id="btn-fix" class="fleeing-btn bg-red-600 text-white px-4 py-2 font-bold rounded shadow-[0_0_15px_red] active:bg-green-500">
+                [ 방화벽 해제 ]
+            </button>
+        </div>
+    </div>
+
+    <script>
+        function getWeaponVisuals(level) {
+            if (level >= 100) return { name: "[창세] 오메가 브레이커", icon: "fa-crown", color: "text-yellow-400", glow: "glow-mythic" };
+            const prefixes = ["낡은", "평범한", "쓸만한", "단단한", "날카로운", "눈부신", "맹렬한", "영광스러운", "초월적인", "완벽한"];
+            const bases = [
+                { name: "나무 몽둥이", icon: "fa-leaf", color: "text-green-600", glow: "glow-normal" },
+                { name: "수습생의 단검", icon: "fa-khanda", color: "text-gray-400", glow: "glow-normal" },
+                { name: "기사의 강철검", icon: "fa-gavel", color: "text-gray-200", glow: "glow-normal" },
+                { name: "피의 마검", icon: "fa-droplet", color: "text-red-500", glow: "glow-magic" },
+                { name: "폭풍의 낫", icon: "fa-fan", color: "text-blue-300", glow: "glow-magic" },
+                { name: "드래곤 슬레이어", icon: "fa-dragon", color: "text-orange-500", glow: "glow-epic" },
+                { name: "심연의 파괴자", icon: "fa-meteor", color: "text-purple-500", glow: "glow-epic" },
+                { name: "별빛의 인도자", icon: "fa-wand-magic-sparkles", color: "text-teal-400", glow: "glow-epic" },
+                { name: "천계의 성검", icon: "fa-cross", color: "text-yellow-200", glow: "glow-legend" },
+                { name: "신을 베는 자", icon: "fa-bolt", color: "text-red-400", glow: "glow-mythic" }
+            ];
+            const tier = Math.floor(level / 10);
+            const step = level % 10;
+            const base = bases[tier];
+            const prefix = prefixes[step];
+            return { name: `${prefix} ${base.name}`, icon: base.icon, color: base.color, glow: base.glow };
+        }
+
+        function showToast(msg, color='bg-gray-800') {
+            const toast = document.getElementById('toast-msg');
+            toast.innerText = msg;
+            toast.className = `fixed top-20 left-1/2 transform -translate-x-1/2 text-white px-6 py-3 rounded-full shadow-2xl transition-opacity duration-300 z-50 font-bold tracking-wide ${color}`;
+            toast.style.opacity = '1';
+            setTimeout(() => { toast.style.opacity = '0'; }, 2000);
+        }
+
+        function updateUI() {
+            document.getElementById('ui-gold').innerText = window.gameState.gold.toLocaleString();
+            document.getElementById('ui-scrap').innerText = window.gameState.scrap.toLocaleString();
+            document.getElementById('ui-level').innerText = `+${window.gameState.level}`;
+            document.getElementById('ui-score').innerText = window.gameState.score.toLocaleString();
+            
+            document.getElementById('box-wood').innerText = window.gameState.boxes.wood;
+            document.getElementById('box-iron').innerText = window.gameState.boxes.iron;
+            document.getElementById('box-gold').innerText = window.gameState.boxes.gold;
+            document.getElementById('box-legend').innerText = window.gameState.boxes.legend;
+
+            const visual = getWeaponVisuals(window.gameState.level);
+            const nameEl = document.getElementById('weapon-name');
+            nameEl.innerText = visual.name;
+            if(window.gameState.level >= 80) nameEl.className = "text-3xl font-black mb-4 text-center tracking-wide text-yellow-400 drop-shadow-[0_0_10px_rgba(250,204,21,0.8)]";
+            else if(window.gameState.level >= 50) nameEl.className = "text-2xl font-black mb-4 text-center tracking-wide text-purple-400";
+            else nameEl.className = "text-2xl font-black mb-4 text-center tracking-wide text-gray-200";
+
+            const iconEl = document.getElementById('weapon-icon');
+            iconEl.className = `fa-solid ${visual.icon} text-7xl transition-all duration-300 ${visual.color} ${visual.glow}`;
+
+            const lvl = window.gameState.level;
+            const costGold = (lvl + 1) * 100 + Math.floor(Math.pow(lvl, 1.5)) * 10;
+            const costScrap = (lvl + 1) * 5 + Math.floor(lvl / 10) * 10;
+            let chance = 100;
+            let destroy = 0;
+            if(lvl >= 10) chance = Math.max(10, 100 - (lvl - 10) * 2);
+            if(lvl >= 50) destroy = Math.min(50, Math.floor((lvl - 50) * 1.5));
+            if(lvl === 100) chance = 0; 
+
+            document.getElementById('ui-cost-gold').innerText = costGold.toLocaleString();
+            document.getElementById('ui-cost-scrap').innerText = costScrap.toLocaleString();
+            document.getElementById('ui-chance').innerText = lvl >= 100 ? "MAX" : chance + "%";
+            
+            const destroyEl = document.getElementById('ui-destroy');
+            destroyEl.innerText = destroy > 0 ? `${destroy}% 확률로 하락` : "안전";
+            destroyEl.className = destroy > 0 ? "text-red-400 font-bold" : "text-blue-400 font-bold";
+        }
+
+        function switchTab(tabId) {
+            ['forge', 'defense', 'inventory', 'leaderboard'].forEach(t => {
+                document.getElementById(`tab-${t}`).classList.add('hidden');
+                document.getElementById(`nav-${t}`).classList.remove('nav-active', 'text-gray-500');
+                if(t === tabId) document.getElementById(`nav-${t}`).classList.add('nav-active');
+                else document.getElementById(`nav-${t}`).classList.add('text-gray-500');
+            });
+            document.getElementById(`tab-${tabId}`).classList.remove('hidden');
+            
+            if(tabId === 'defense' && window.currentUserId) {
+                document.getElementById('defense-farm').classList.add('flex');
+            }
+        }
+
+        function upgradeWeapon() {
+            const lvl = window.gameState.level;
+            if (lvl >= 100) { showToast('이미 최대 레벨입니다!', 'bg-blue-600'); return; }
+
+            const costGold = (lvl + 1) * 100 + Math.floor(Math.pow(lvl, 1.5)) * 10;
+            const costScrap = (lvl + 1) * 5 + Math.floor(lvl / 10) * 10;
+            let chance = 100;
+            let destroy = 0;
+            if(lvl >= 10) chance = Math.max(10, 100 - (lvl - 10) * 2);
+            if(lvl >= 50) destroy = Math.min(50, Math.floor((lvl - 50) * 1.5));
+
+            if (window.gameState.gold < costGold || window.gameState.scrap < costScrap) {
+                showToast('강화에 필요한 자원이 부족합니다!', 'bg-red-600');
+                return;
+            }
+
+            window.gameState.gold -= costGold;
+            window.gameState.scrap -= costScrap;
+
+            const roll = Math.random() * 100;
+            const icon = document.getElementById('weapon-icon');
+            
+            icon.classList.remove('upgrade-effect');
+            void icon.offsetWidth; 
+            icon.classList.add('upgrade-effect');
+
+            if (roll <= chance) {
+                window.gameState.level++;
+                if(window.gameState.level % 10 === 0) showToast('무기가 새로운 형태로 진화했습니다! 💥', 'bg-yellow-600');
+                else showToast('강화 성공! 🎉', 'bg-green-600');
+                if(window.syncData) window.syncData();
+            } else {
+                const failRoll = Math.random() * 100;
+                if (failRoll <= destroy) {
+                    window.gameState.level = Math.max(0, window.gameState.level - 5);
+                    showToast('강화 실패! 무기가 파손되어 레벨이 하락했습니다 💀', 'bg-red-800');
+                } else {
+                    showToast('강화에 실패했습니다...', 'bg-gray-600');
+                }
+            }
+            updateUI();
+        }
+
+        function mergeBox(from, to, amount) {
+            if (window.gameState.boxes[from] >= amount) {
+                window.gameState.boxes[from] -= amount;
+                window.gameState.boxes[to]++;
+                showToast('상자 합성 성공!', 'bg-blue-600');
+                updateUI();
+            } else showToast(`상자가 ${amount}개 필요합니다.`, 'bg-red-600');
+        }
+
+        function openBox(type) {
+            if (window.gameState.boxes[type] <= 0) { showToast('열 수 있는 상자가 없습니다.', 'bg-red-600'); return; }
+            window.gameState.boxes[type]--;
+            
+            let goldGet = 0, scrapGet = 0;
+            if(type === 'wood') { goldGet = 50 + Math.random()*50; scrapGet = 5 + Math.random()*5; }
+            if(type === 'iron') { goldGet = 300 + Math.random()*200; scrapGet = 20 + Math.random()*15; }
+            if(type === 'gold') { goldGet = 1500 + Math.random()*1000; scrapGet = 100 + Math.random()*50; window.gameState.magic += 1;}
+            if(type === 'legend') { goldGet = 10000; scrapGet = 500; window.gameState.magic += 10; showToast('전설의 기운이 솟아오릅니다...!', 'bg-purple-600'); }
+
+            window.gameState.gold += Math.floor(goldGet);
+            window.gameState.scrap += Math.floor(scrapGet);
+            updateUI();
+        }
+
+        function sellResource(type, amount, price) {
+            if (window.gameState[type] >= amount) {
+                window.gameState[type] -= amount;
+                window.gameState.gold += price;
+                showToast('물품을 판매했습니다.', 'bg-green-600');
+                updateUI();
+            } else showToast('자원이 부족합니다.', 'bg-red-600');
+        }
+
+        let devClicks = 0;
+        let devModeActive = false;
+        let devTimer, panicTimer;
+
+        document.getElementById('dev-trigger').addEventListener('click', () => {
+            if(devModeActive) return;
+            devClicks++;
+            if(devClicks >= 5) { triggerDevMode(); devClicks = 0; }
+            setTimeout(() => { devClicks = 0; }, 2000);
+        });
+
+        function triggerDevMode() {
+            devModeActive = true;
+            const overlay = document.getElementById('dev-overlay');
+            overlay.style.display = 'flex';
+            overlay.classList.add('glitch-anim');
+            
+            const fixBtn = document.getElementById('btn-fix');
+            let progress = 12;
+
+            const moveBtn = () => {
+                const container = fixBtn.parentElement;
+                const maxX = container.clientWidth - fixBtn.clientWidth;
+                const maxY = container.clientHeight - fixBtn.clientHeight;
+                fixBtn.style.left = Math.random() * maxX + 'px';
+                fixBtn.style.top = Math.random() * maxY + 'px';
+            };
+
+            fixBtn.addEventListener('touchstart', moveBtn);
+            fixBtn.addEventListener('mouseenter', moveBtn);
+
+            fixBtn.onclick = () => {
+                clearInterval(devTimer); clearInterval(panicTimer);
+                overlay.style.display = 'none'; overlay.classList.remove('glitch-anim');
+                devModeActive = false;
+                
+                window.gameState.boxes.legend += 3;
+                showToast('시스템 권한 획득. 전설 상자 3개를 얻었습니다.', 'bg-purple-700');
+                updateUI();
+                if(window.syncData) window.syncData();
+                
+                fixBtn.removeEventListener('touchstart', moveBtn);
+                fixBtn.removeEventListener('mouseenter', moveBtn);
+            };
+
+            devTimer = setInterval(() => {
+                progress += Math.floor(Math.random() * 5);
+                document.getElementById('dev-progress').innerText = progress;
+                if(progress >= 99) {
+                    clearInterval(devTimer); clearInterval(panicTimer);
+                    overlay.style.display = 'none'; overlay.classList.remove('glitch-anim');
+                    devModeActive = false;
+                    
+                    window.gameState.level = Math.max(0, window.gameState.level - 10);
+                    window.gameState.gold = 0;
+                    showToast('치명적 에러: 무기 레벨 대폭 하락 및 골드 소실', 'bg-red-800');
+                    updateUI();
+                }
+            }, 300);
+
+            panicTimer = setInterval(moveBtn, 800);
+        }
+
+        updateUI();
+    </script>
+</body>
+</html>
